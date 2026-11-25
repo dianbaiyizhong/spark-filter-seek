@@ -29,7 +29,7 @@ public final class SeekScanBuilder implements ScanBuilder,
   private SeekPredicate predicate;
   private Filter[] acceptedFilters = new Filter[0];
   private Filter[] remainingFilters = new Filter[0];
-  /** -1 means no limit was accepted; LIMIT is only accepted when Redis is configured. */
+  /** -1 means no limit was accepted; LIMIT is accepted only when Redis control is explicitly on. */
   private int limit = -1;
   private String redisKey;
 
@@ -65,9 +65,10 @@ public final class SeekScanBuilder implements ScanBuilder,
 
   @Override
   public boolean pushLimit(int value) {
-    // Without Redis there is no way to coordinate a global cap across partitions, so leave the
-    // LIMIT to Spark's own GlobalLimit (correct, just no early stop inside the scan).
-    if (value < 0 || ConfUtils.redisAddress(options) == null) {
+    // Redis control is disabled by default. When it is off (or no address is configured) there
+    // is no way to coordinate a global cap across partitions, so leave LIMIT to Spark's own
+    // GlobalLimit: correct, just no early stop inside the scan and zero Redis traffic.
+    if (value < 0 || !ConfUtils.redisEnabled(options) || ConfUtils.redisAddress(options) == null) {
       return false;
     }
     this.limit = value;

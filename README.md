@@ -44,7 +44,7 @@ ORC 阶段二通过 `RecordReader.seekToRow(globalRowId)` 直接定位；Parquet
 - 集合：`IN (...)`、`NOT IN (...)`
 - 字符串：`LIKE 'abc%'`（`%` / `_` 通配符）、`NOT LIKE`
 - 逻辑：`AND` / `OR` / `NOT`
-- 行数：`LIMIT N`（可选，配置 Redis 后下推到扫描阶段，多分区共享一个全局计数器；详见第 6 节）
+- 行数：`LIMIT N`（默认由 Spark 处理；显式启用 Redis 后才下推到扫描阶段，多分区共享一个全局计数器；详见 5.2 节）
 
 不支持的表达式（函数、算术、子查询、嵌套字段等）**不会**被吞掉：数据源会把它们返回给 Spark
 重新计算，保证结果正确。阶段一的统计剪枝是保守的，宁可多读块也不会漏掉命中行。
@@ -149,7 +149,8 @@ lower() with ignoreCase=false   : 44 (expected 44)
 | `seek.sql` | 空 | 用 Druid 解析 WHERE 子句 |
 | `seek.dumpPlan` | `false` | 在 executor 日志打印每个块的命中行位置样例 |
 | `seek.ignoreCase` | 取 SparkConf，默认 `true` | 字符串比较是否忽略大小写；优先级高于 SparkConf |
-| `seek.redis.address` | 无 | Redis 地址，如 `redis://127.0.0.1:6379`；配置后才启用 LIMIT 下推 |
+| `seek.redis.enabled` | `false` | Redis 全局 LIMIT 控制总开关，默认关闭；设为 `true` 且配置了地址才生效 |
+| `seek.redis.address` | 无 | Redis 地址，如 `redis://127.0.0.1:6379`；需同时 `seek.redis.enabled=true` |
 | `seek.redis.password` | 空 | Redis 密码 |
 | `seek.redis.database` | `0` | Redis 数据库编号 |
 | `seek.redis.batch` | `1000` | 每个 task 每次向 Redis 领取的额度条数 |
@@ -216,10 +217,11 @@ SeekPlan{orc /data/a.orc, blocks=12, pruned=9, rowsScanned=30000, hits=127}
 
 ## 5.2 用 Redis 做全局 LIMIT 控制
 
-不配置 Redis 时，`LIMIT` 由 Spark 自己的 `GlobalLimit` 在 scan 之后处理，扫描层不做提前终止。
-配置 Redis 地址后，`LIMIT N` 会下推到扫描层，所有分区共享一个 Redis 原子计数器：
+**默认不启用。** 关闭时 `LIMIT` 由 Spark 自己的 `GlobalLimit` 在 scan 之后处理，扫描层不做
+提前终止，也不会创建任何 Redis 客户端或产生 Redis 往返。要启用必须**同时**打开开关并配置地址：
 
 ```scala
+spark.conf.set("spark.filterseek.redis.enabled", "true")   // 默认 false，必须显式打开
 spark.conf.set("spark.filterseek.redis.address", "redis://redis-host:6379")
 spark.conf.set("spark.filterseek.redis.password", "xxx")   // 可选
 
@@ -243,6 +245,9 @@ spark.sql("SELECT * FROM t WHERE amount > 100 LIMIT 10000").show()
 
 注意：
 
+- 若集群级 SparkConf 已配置 Redis 地址，某次读取仍可用 `.option("seek.redis.enabled", "false")`
+  或 `spark.conf.set("spark.filterseek.redis.enabled", "false")` 强制关闭；per-read option 优先级更高。
+  仅设置地址（不打开开关）不会启用该功能。
 - Redisson 及其依赖（含 Netty）已 shade 进主 jar 并做了包名重定位，无需随任务单独提交；只有 Druid 仍需单独带 jar（见 3.1 构建）。
 - 配额块是"先占后用"，task 结束时未用完的额度只在本地归还，不回写 Redis，
   因此极端情况下（大量 task 各自只领不用）实际返回可能略少于 N，但绝不会超过 N。

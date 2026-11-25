@@ -26,6 +26,10 @@ public final class ConfUtils {
   public static final String IGNORE_CASE_SPARK_CONF = "spark.filterseek.ignoreCase";
   public static final boolean DEFAULT_IGNORE_CASE = true;
 
+  /** Master switch for Redis-backed global LIMIT control. Off by default. */
+  public static final String REDIS_ENABLED_OPTION = "seek.redis.enabled";
+  public static final String REDIS_ENABLED_SPARK_CONF = "spark.filterseek.redis.enabled";
+  public static final boolean DEFAULT_REDIS_ENABLED = false;
   /** Redis address for global LIMIT control, e.g. redis://127.0.0.1:6379. */
   public static final String REDIS_ADDRESS_OPTION = "seek.redis.address";
   public static final String REDIS_ADDRESS_SPARK_CONF = "spark.filterseek.redis.address";
@@ -92,6 +96,15 @@ public final class ConfUtils {
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException("Invalid integer for " + optionKey + ": " + raw, e);
     }
+  }
+
+  /**
+   * Redis LIMIT control is opt-in: absent switch means disabled even if an address is present.
+   * Per-read option wins over the session-level SparkConf value.
+   */
+  public static boolean redisEnabled(Map<String, String> options) {
+    String raw = resolve(options, REDIS_ENABLED_OPTION, REDIS_ENABLED_SPARK_CONF, null);
+    return raw == null ? DEFAULT_REDIS_ENABLED : Boolean.parseBoolean(raw);
   }
 
   public static String redisAddress(Map<String, String> options) {

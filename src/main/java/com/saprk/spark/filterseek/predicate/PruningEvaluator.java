@@ -24,12 +24,18 @@ public final class PruningEvaluator {
   }
 
   public static boolean mayMatch(SeekPredicate predicate, ColumnStatsProvider provider) {
+    return mayMatch(predicate, provider, false);
+  }
+
+  /** Case-aware variant; string bounds and values are folded together before range checks. */
+  public static boolean mayMatch(SeekPredicate predicate, ColumnStatsProvider provider,
+      boolean globalIgnoreCase) {
     if (predicate == null) {
       return true;
     }
     if (predicate instanceof SeekPredicate.And) {
       for (SeekPredicate child : ((SeekPredicate.And) predicate).children()) {
-        if (!mayMatch(child, provider)) {
+        if (!mayMatch(child, provider, globalIgnoreCase)) {
           return false;
         }
       }
@@ -37,7 +43,7 @@ public final class PruningEvaluator {
     }
     if (predicate instanceof SeekPredicate.Or) {
       for (SeekPredicate child : ((SeekPredicate.Or) predicate).children()) {
-        if (mayMatch(child, provider)) {
+        if (mayMatch(child, provider, globalIgnoreCase)) {
           return true;
         }
       }
@@ -57,7 +63,9 @@ public final class PruningEvaluator {
       if (c.op() == SeekPredicate.Op.NE) {
         return true;
       }
-      return rangeMayMatch(c.op(), stats.min(), stats.max(), c.value().value());
+      Object[] folded = fold(stats.min(), stats.max(), c.value().value(),
+          PredicateCase.effective(c, globalIgnoreCase));
+      return rangeMayMatch(c.op(), folded[0], folded[1], folded[2]);
     }
     if (predicate instanceof SeekPredicate.In) {
       SeekPredicate.In in = (SeekPredicate.In) predicate;
@@ -68,13 +76,36 @@ public final class PruningEvaluator {
       if (stats == null || stats.min() == null || stats.max() == null) {
         return true;
       }
+      boolean fold = PredicateCase.effective(in, globalIgnoreCase);
+      if (fold) {
+        java.util.List<Object> raw = new java.util.ArrayList<>();
+        for (LiteralValue value : in.values()) {
+          raw.add(value.value());
+        }
+        fold = PredicateCase.needsStringDomain(raw);
+      }
+      Object blockMin = fold ? PredicateCase.text(stats.min(), true) : stats.min();
+      Object blockMax = fold ? PredicateCase.text(stats.max(), true) : stats.max();
+      Object valueMin = null;
+      Object valueMax = null;
       for (LiteralValue value : in.values()) {
-        if (value.value() == null
-            || rangeMayMatch(SeekPredicate.Op.EQ, stats.min(), stats.max(), value.value())) {
-          return true;
+        if (value.value() == null) {
+          continue;
+        }
+        Object normalized = fold ? PredicateCase.text(value.value(), true) : value.value();
+        if (valueMin == null || LiteralValue.compare(normalized, valueMin) < 0) {
+          valueMin = normalized;
+        }
+        if (valueMax == null || LiteralValue.compare(normalized, valueMax) > 0) {
+          valueMax = normalized;
         }
       }
-      return false;
+      if (valueMin == null) {
+        return false;
+      }
+      // The block can only match if its [min,max] intersects the IN list's [min,max].
+      return LiteralValue.compare(valueMax, blockMin) >= 0
+          && LiteralValue.compare(valueMin, blockMax) <= 0;
     }
     if (predicate instanceof SeekPredicate.Like) {
       SeekPredicate.Like like = (SeekPredicate.Like) predicate;
@@ -89,10 +120,25 @@ public final class PruningEvaluator {
       if (prefix == null || prefix.isEmpty()) {
         return true;
       }
+      boolean fold = PredicateCase.effective(like, globalIgnoreCase);
+      Object blockMax = fold ? PredicateCase.text(stats.max(), true) : stats.max();
+      Object foldedPrefix = fold ? prefix.toLowerCase(java.util.Locale.ROOT) : prefix;
       // A string matching a prefix-start pattern is lexicographically >= that prefix.
-      return LiteralValue.compare(stats.max(), prefix) >= 0;
+      return LiteralValue.compare(blockMax, foldedPrefix) >= 0;
     }
     return true;
+  }
+
+  /** Fold string bounds/values to lower case only when a string is actually involved. */
+  private static Object[] fold(Object min, Object max, Object value, boolean ignoreCase) {
+    if (ignoreCase && (min instanceof CharSequence || max instanceof CharSequence
+        || value instanceof CharSequence)) {
+      return new Object[] {
+          PredicateCase.text(min, true), PredicateCase.text(max, true),
+          PredicateCase.text(value, true)
+      };
+    }
+    return new Object[] {min, max, value};
   }
 
   private static boolean rangeMayMatch(SeekPredicate.Op op, Object min, Object max, Object value) {

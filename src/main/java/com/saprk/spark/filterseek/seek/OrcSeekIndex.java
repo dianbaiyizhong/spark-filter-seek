@@ -55,6 +55,8 @@ public final class OrcSeekIndex implements SeekIndex {
   public SeekPlan build(String file, StructType tableSchema, SeekPredicate predicate,
       Map<String, String> confMap) throws IOException {
     Configuration conf = ConfUtils.hadoopConf(confMap);
+    boolean ignoreCase = ConfUtils.ignoreCase(confMap);
+    PredicateEvaluator evaluator = PredicateEvaluator.compile(predicate, ignoreCase);
     Reader reader = OrcFile.createReader(new Path(file), OrcFile.readerOptions(conf));
     TypeDescription schema = reader.getSchema();
     List<String> names = schema.getFieldNames();
@@ -83,7 +85,7 @@ public final class OrcSeekIndex implements SeekIndex {
         long stripeRows = stripes.get(stripeIndex).getNumberOfRows();
         PruningEvaluator.ColumnStatsProvider stats = new OrcColumnStatsProvider(
             stripeStats.get(stripeIndex), schema, names);
-        if (!PruningEvaluator.mayMatch(predicate, stats)) {
+        if (!PruningEvaluator.mayMatch(predicate, stats, ignoreCase)) {
           blocksPruned++;
           stripeStart += stripeRows;
           continue;
@@ -96,7 +98,7 @@ public final class OrcSeekIndex implements SeekIndex {
           int count = (int) Math.min(remaining, batch.size);
           for (int r = 0; r < count; r++) {
             Map<String, Object> values = extract(batch, r, filterColumns, names, tableSchema);
-            if (PredicateEvaluator.test(predicate, values)) {
+            if (evaluator.matches(values)) {
               long globalRow = stripeStart + rowInStripe + r;
               hits.add(new SeekHit(file, stripeIndex, rowInStripe + r, globalRow));
             }

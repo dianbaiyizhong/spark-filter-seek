@@ -49,6 +49,8 @@ public final class ParquetSeekIndex implements SeekIndex {
   public SeekPlan build(String file, StructType tableSchema, SeekPredicate predicate,
       Map<String, String> confMap) throws IOException {
     Configuration conf = ConfUtils.hadoopConf(confMap);
+    boolean ignoreCase = ConfUtils.ignoreCase(confMap);
+    PredicateEvaluator evaluator = PredicateEvaluator.compile(predicate, ignoreCase);
     try (ParquetFileReader reader = ParquetFileReader.open(
         HadoopInputFile.fromPath(new Path(file), conf))) {
       MessageType schema = reader.getFileMetaData().getSchema();
@@ -79,7 +81,7 @@ public final class ParquetSeekIndex implements SeekIndex {
         BlockMetaData block = blocks.get(blockIndex);
         PruningEvaluator.ColumnStatsProvider stats =
             new ParquetStatsProvider(block, fieldNames, descriptors);
-        if (!PruningEvaluator.mayMatch(predicate, stats)) {
+        if (!PruningEvaluator.mayMatch(predicate, stats, ignoreCase)) {
           blocksPruned++;
           rowBase += block.getRowCount();
           continue;
@@ -112,7 +114,7 @@ public final class ParquetSeekIndex implements SeekIndex {
                 ? value(converters.get(entry.getKey()).value(), type, descriptor) : null);
             columnReader.consume();
           }
-          if (PredicateEvaluator.test(predicate, values)) {
+          if (evaluator.matches(values)) {
             long globalRow = rowBase + row;
             hits.add(new SeekHit(file, blockIndex, row, globalRow));
           }

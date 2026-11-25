@@ -59,6 +59,8 @@ public final class SeekScan implements Scan {
     public InputPartition[] planInputPartitions() {
       Configuration conf = ConfUtils.hadoopConf(options);
       Map<String, String> confMap = ConfUtils.confToMap(conf);
+      // Resolve on the driver (SparkConf lives here) and ship the decision to executors.
+      confMap.put(ConfUtils.IGNORE_CASE_OPTION, String.valueOf(ConfUtils.ignoreCase(options)));
       InputPartition[] partitions = new InputPartition[files.size()];
       for (int i = 0; i < files.size(); i++) {
         partitions[i] = new SeekInputPartition(files.get(i), format, predicate, readSchema, confMap);

@@ -130,6 +130,9 @@ JAVA_HOME=<JDK 17> mvn -q clean package
 ORC  Spark-pushdown filter hits : 64 (expected 64)
 Parquet LIKE filter hits        : 95 (expected 95)
 Druid seek.sql filter hits      : 108 (expected 108)
+SparkConf ignoreCase hits       : 44 (expected 44)
+Option ignoreCase=false hits    : 0 (expected 0)
+lower() with ignoreCase=false   : 44 (expected 44)
 ```
 
 ---
@@ -142,7 +145,20 @@ Druid seek.sql filter hits      : 108 (expected 108)
 | `format` | 按扩展名推断 | `orc` 或 `parquet` |
 | `seek.sql` | 空 | 用 Druid 解析 WHERE 子句 |
 | `seek.dumpPlan` | `false` | 在 executor 日志打印每个块的命中行位置样例 |
+| `seek.ignoreCase` | 取 SparkConf，默认 `true` | 字符串比较是否忽略大小写；优先级高于 SparkConf |
 | `hadoop.*` | 无 | 以 `hadoop.` 开头的参数会去掉前缀后写入 Hadoop Configuration |
+
+会话级开关（可用 `spark-submit --conf` 或 `spark.conf.set`）：
+
+```bash
+spark-submit --conf spark.filterseek.ignoreCase=false ...
+```
+
+说明：
+
+- 默认忽略大小写，因此 `lower(name) = '11'` 这类写法可以正常下推；`lower` / `upper` /
+  `lcase` / `ucase` 包裹的列会被解包，并强制该叶子谓词忽略大小写（即使全局开关为 `false`）。
+- 其他函数（如 `substring(name,1,1)`）不会静默忽略，会显式报错，剩余条件可交给 Spark 重算。
 
 ---
 
@@ -155,6 +171,8 @@ Druid seek.sql filter hits      : 108 (expected 108)
 | ORC stripe 大小 | 过滤选择率低时减小 stripe（如 8~64MB），提高剪枝粒度 | 看 `Phase-1 seek plan` 中 `pruned / blocks` |
 | Parquet row group | 用 `parquet.block.size` 控制，过小会增加 footer 开销 | 对比 `rowsScanned` 与原表行数 |
 | 过滤字段数 | 只把真正用于过滤的列放在 WHERE 里，阶段一只读这些列 | 观察远端读字节量 |
+| IN 大列表 | 阶段一每个分区只构建一次 HashSet，每行 O(1) 判定；几百个值也可直接下推 | 对比 IN 值数量翻倍前后的 `rowsScanned` 与耗时 |
+| LIKE 大批量 | 正则每个分区只编译一次，不再逐行 `Pattern.compile` | 看 executor 火焰图中正则编译占比 |
 | SELECT 列数 | 列裁剪越窄，阶段二带宽越省 | 对比全列读取的 bytes read |
 | 统计信息 | ORC/Parquet 写入时确保开启 column statistics | `describe` / 元数据里检查 min/max |
 | 无过滤查询 | 没有可下推谓词时退化为普通列裁剪扫描 | 日志出现 `No pushed predicate` |
@@ -194,7 +212,7 @@ SeekPlan{orc /data/a.orc, blocks=12, pruned=9, rowsScanned=30000, hits=127}
 4. `NOT` / `NOT LIKE` 不做统计剪枝（保证不误删），但求值精确。
 5. Parquet 阶段二会遍历含命中行的整个 row group 的列值（只读所需列），未实现行级 `skip()`；
    如 row group 很大，可调小 `parquet.block.size`。
-6. Druid 解析只接受简单 `SELECT ... FROM ... WHERE ...`；复杂 JOIN / 子查询请交给 Spark 下推 Filter。
+6. Druid 解析只接受简单 `SELECT ... FROM ... WHERE ...`；列上仅允许 `lower` / `upper` / `lcase` / `ucase` 包裹，复杂 JOIN / 子查询 / 其他函数请交给 Spark 下推 Filter。
 7. 无谓词时退化为普通列裁剪扫描，不做位置索引。
 
 ---

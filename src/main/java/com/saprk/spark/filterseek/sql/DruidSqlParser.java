@@ -16,6 +16,7 @@ import com.alibaba.druid.sql.ast.expr.SQLBinaryOperator;
 import com.alibaba.druid.sql.ast.expr.SQLIdentifierExpr;
 import com.alibaba.druid.sql.ast.expr.SQLInListExpr;
 import com.alibaba.druid.sql.ast.expr.SQLLiteralExpr;
+import com.alibaba.druid.sql.ast.expr.SQLMethodInvokeExpr;
 import com.alibaba.druid.sql.ast.expr.SQLPropertyExpr;
 import com.alibaba.druid.sql.ast.expr.SQLUnaryExpr;
 import com.alibaba.druid.sql.ast.expr.SQLUnaryOperator;
@@ -39,8 +40,26 @@ import com.saprk.spark.filterseek.predicate.SeekPredicate;
  */
 public final class DruidSqlParser {
 
+  /**
+   * Wrappers that only fold case. Unwrapping them is safe as long as the resulting leaf is
+   * evaluated case-insensitively, regardless of the session-level setting.
+   */
+  private static final Set<String> CASE_FOLDING_FUNCTIONS = new java.util.HashSet<>(
+      java.util.Arrays.asList("lower", "lcase", "upper", "ucase"));
+
   private final Set<String> knownColumns;
   private final java.util.Map<String, DataType> dataTypeByName = new java.util.HashMap<>();
+
+  /** A resolved column plus whether a case-folding wrapper was seen on the left-hand side. */
+  private static final class ColumnRef {
+    final String name;
+    final boolean caseFolded;
+
+    ColumnRef(String name, boolean caseFolded) {
+      this.name = name;
+      this.caseFolded = caseFolded;
+    }
+  }
 
   public DruidSqlParser(StructType schema) {
     this.knownColumns = new LinkedHashSet<>();
@@ -99,12 +118,13 @@ public final class DruidSqlParser {
     }
     if (expr instanceof SQLInListExpr) {
       SQLInListExpr in = (SQLInListExpr) expr;
-      String column = columnName(in.getExpr());
+      ColumnRef ref = columnRef(in.getExpr());
       List<LiteralValue> values = new ArrayList<>();
       for (SQLExpr target : in.getTargetList()) {
-        values.add(literal(target, columnType(column)));
+        values.add(literal(target, columnType(ref.name)));
       }
-      return new SeekPredicate.In(column, values, in.isNot());
+      return new SeekPredicate.In(ref.name, values, in.isNot(),
+          forcedIgnoreCase(ref.caseFolded, false));
     }
     if (expr instanceof SQLUnaryExpr) {
       SQLUnaryExpr unary = (SQLUnaryExpr) expr;
@@ -130,18 +150,21 @@ public final class DruidSqlParser {
     }
     if (op == SQLBinaryOperator.Like || op == SQLBinaryOperator.NotLike
         || op == SQLBinaryOperator.ILike || op == SQLBinaryOperator.NotILike) {
-      String column = columnName(binary.getLeft());
-      String pattern = stringValue(binary.getRight(), column);
-      return new SeekPredicate.Like(column, pattern,
-          op == SQLBinaryOperator.NotLike || op == SQLBinaryOperator.NotILike);
+      ColumnRef ref = columnRef(binary.getLeft());
+      String pattern = stringValue(binary.getRight(), ref.name);
+      boolean iLike = op == SQLBinaryOperator.ILike || op == SQLBinaryOperator.NotILike;
+      return new SeekPredicate.Like(ref.name, pattern,
+          op == SQLBinaryOperator.NotLike || op == SQLBinaryOperator.NotILike,
+          forcedIgnoreCase(iLike, ref.caseFolded));
     }
     SeekPredicate.Op cmp = comparison(op);
     if (cmp == null) {
       throw unsupported("operator " + op.getName());
     }
-    String column = columnName(binary.getLeft());
-    DataType dataType = columnType(column);
-    return new SeekPredicate.Comparison(column, cmp, literal(binary.getRight(), dataType));
+    ColumnRef ref = columnRef(binary.getLeft());
+    DataType dataType = columnType(ref.name);
+    return new SeekPredicate.Comparison(ref.name, cmp,
+        literal(binary.getRight(), dataType), forcedIgnoreCase(false, ref.caseFolded));
   }
 
   private SeekPredicate.Op comparison(SQLBinaryOperator op) {
@@ -166,21 +189,37 @@ public final class DruidSqlParser {
     }
   }
 
-  private String columnName(SQLExpr expr) {
+  private ColumnRef columnRef(SQLExpr expr) {
+    boolean caseFolded = false;
+    while (expr instanceof SQLMethodInvokeExpr) {
+      SQLMethodInvokeExpr call = (SQLMethodInvokeExpr) expr;
+      String method = call.getMethodName() == null ? "" : call.getMethodName().toLowerCase(Locale.ROOT);
+      if (!CASE_FOLDING_FUNCTIONS.contains(method)
+          || call.getArguments() == null || call.getArguments().size() != 1) {
+        throw unsupported("function " + method + " on a filter column");
+      }
+      caseFolded = true;
+      expr = call.getArguments().get(0);
+    }
     String name;
     if (expr instanceof SQLIdentifierExpr) {
       name = ((SQLIdentifierExpr) expr).getName();
     } else if (expr instanceof SQLPropertyExpr) {
       name = ((SQLPropertyExpr) expr).getName();
     } else {
-      throw unsupported("filter left-hand side must be a simple column, got "
+      throw unsupported("filter left-hand side must be a simple column "
+          + "(optionally wrapped in lower/upper), got "
           + (expr == null ? "null" : expr.getClass().getSimpleName()));
     }
     String lower = name.toLowerCase(Locale.ROOT);
     if (!knownColumns.contains(lower)) {
       throw new IllegalArgumentException("Unknown or unsupported filter column: " + name);
     }
-    return lower;
+    return new ColumnRef(lower, caseFolded);
+  }
+
+  private static Boolean forcedIgnoreCase(boolean explicit, boolean caseFolded) {
+    return explicit || caseFolded ? Boolean.TRUE : null;
   }
 
   private DataType columnType(String column) {
@@ -217,6 +256,7 @@ public final class DruidSqlParser {
   private static IllegalArgumentException unsupported(String what) {
     return new IllegalArgumentException(
         "Unsupported predicate for seek scan: " + what
-            + ". Supported: =, <>, >, >=, <, <=, IN, LIKE, AND, OR, NOT on primitive columns.");
+            + ". Supported: =, <>, >, >=, <, <=, IN, LIKE, AND, OR, NOT on primitive columns, "
+            + "optionally wrapped in lower()/upper().");
   }
 }

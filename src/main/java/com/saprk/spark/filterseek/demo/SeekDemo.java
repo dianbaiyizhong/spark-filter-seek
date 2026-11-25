@@ -29,12 +29,25 @@ public final class SeekDemo {
     run();
   }
 
+  /** 60 values: large enough to expose a per-row linear scan of the IN list. */
+  private static String largeInList() {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < 60; i++) {
+      if (i > 0) {
+        sb.append(',');
+      }
+      sb.append(i);
+    }
+    return sb.toString();
+  }
+
   public static DemoResult run() throws Exception {
     SparkSession spark = SparkSession.builder()
         .master("local[2]")
         .appName("spark-filter-seek-demo")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.filterseek.ignoreCase", "true")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .getOrCreate();
@@ -96,12 +109,37 @@ public final class SeekDemo {
           .filter(r -> "US".equals(r.getString(1)) && r.getLong(2) >= 50)
           .count();
 
+      String inList = largeInList();
+      long expectedIn = data.stream()
+          .filter(r -> "CN".equals(r.getString(1)) && r.getLong(2) < 60)
+          .count();
+
+      // SparkConf supplies the default: region = 'cn' matches 'CN'.
+      String ciSql = "SELECT * FROM t WHERE region = 'cn' AND amount IN (" + inList + ")";
+      long confCaseCount = spark.read().format("filter-seek")
+          .option("path", parquetPath).option("seek.sql", ciSql).load().count();
+
+      // Per-read option overrides SparkConf: plain comparison becomes case-sensitive.
+      long exactCount = spark.read().format("filter-seek")
+          .option("path", parquetPath).option("seek.sql", ciSql)
+          .option("seek.ignoreCase", "false").load().count();
+
+      // lower(...) forces case-insensitive evaluation for that leaf even when the option is false.
+      String foldedSql = "SELECT * FROM t WHERE lower(region) = 'cn' AND amount IN (" + inList + ")";
+      long foldedCount = spark.read().format("filter-seek")
+          .option("path", parquetPath).option("seek.sql", foldedSql)
+          .option("seek.ignoreCase", "false").load().count();
+
       System.out.println("ORC  Spark-pushdown filter hits : " + orcCount + " (expected " + expected + ")");
       System.out.println("Parquet LIKE filter hits        : " + parquetCount + " (expected " + expectedLike + ")");
       System.out.println("Druid seek.sql filter hits      : " + druidCount + " (expected " + expectedDruid + ")");
+      System.out.println("SparkConf ignoreCase hits       : " + confCaseCount + " (expected " + expectedIn + ")");
+      System.out.println("Option ignoreCase=false hits    : " + exactCount + " (expected 0)");
+      System.out.println("lower() with ignoreCase=false   : " + foldedCount + " (expected " + expectedIn + ")");
 
       return new DemoResult(orcCount == expected, parquetCount == expectedLike,
-          druidCount == expectedDruid);
+          druidCount == expectedDruid, confCaseCount == expectedIn, exactCount == 0,
+          foldedCount == expectedIn);
     } finally {
       spark.stop();
     }
@@ -111,15 +149,23 @@ public final class SeekDemo {
     public final boolean orcOk;
     public final boolean parquetOk;
     public final boolean druidOk;
+    public final boolean sparkConfIgnoreCaseOk;
+    public final boolean optionOverrideOk;
+    public final boolean foldedFunctionOk;
 
-    DemoResult(boolean orcOk, boolean parquetOk, boolean druidOk) {
+    DemoResult(boolean orcOk, boolean parquetOk, boolean druidOk,
+        boolean sparkConfIgnoreCaseOk, boolean optionOverrideOk, boolean foldedFunctionOk) {
       this.orcOk = orcOk;
       this.parquetOk = parquetOk;
       this.druidOk = druidOk;
+      this.sparkConfIgnoreCaseOk = sparkConfIgnoreCaseOk;
+      this.optionOverrideOk = optionOverrideOk;
+      this.foldedFunctionOk = foldedFunctionOk;
     }
 
     public boolean allOk() {
-      return orcOk && parquetOk && druidOk;
+      return orcOk && parquetOk && druidOk && sparkConfIgnoreCaseOk
+          && optionOverrideOk && foldedFunctionOk;
     }
   }
 }

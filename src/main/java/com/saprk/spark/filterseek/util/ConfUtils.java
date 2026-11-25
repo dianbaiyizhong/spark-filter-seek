@@ -11,6 +11,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.spark.sql.SparkSession;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -19,7 +20,45 @@ public final class ConfUtils {
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
+  /** Per-read override. Wins over the SparkConf key below. */
+  public static final String IGNORE_CASE_OPTION = "seek.ignoreCase";
+  /** Session-level setting: spark.conf.set("spark.filterseek.ignoreCase", "true|false"). */
+  public static final String IGNORE_CASE_SPARK_CONF = "spark.filterseek.ignoreCase";
+  public static final boolean DEFAULT_IGNORE_CASE = true;
+
   private ConfUtils() {
+  }
+
+  /**
+   * Resolve case-sensitivity on the driver. Option first, then SparkConf, defaulting to true.
+   * The resolved value is injected into the partition conf map so executors never need a
+   * SparkSession.
+   */
+  public static boolean ignoreCase(Map<String, String> options) {
+    String raw = options == null ? null : options.get(IGNORE_CASE_OPTION);
+    if (isBlank(raw)) {
+      raw = sparkConfValue(IGNORE_CASE_SPARK_CONF);
+    }
+    if (isBlank(raw)) {
+      return DEFAULT_IGNORE_CASE;
+    }
+    return Boolean.parseBoolean(raw.trim());
+  }
+
+  private static String sparkConfValue(String key) {
+    try {
+      scala.Option<SparkSession> active = SparkSession.getActiveSession();
+      if (active.isDefined()) {
+        return active.get().sparkContext().getConf().get(key, null);
+      }
+    } catch (Throwable ignored) {
+      // No active session (unit tests, non-Spark callers): fall back to the default.
+    }
+    return null;
+  }
+
+  private static boolean isBlank(String value) {
+    return value == null || value.trim().isEmpty();
   }
 
   public static Configuration hadoopConf(Map<String, String> options) {

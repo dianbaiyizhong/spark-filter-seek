@@ -111,4 +111,75 @@ public class SeekPredicateTest {
         "SELECT * FROM t WHERE amount >= 15");
     assertTrue(PruningEvaluator.mayMatch(possible, provider));
   }
+
+  @Test
+  public void druidUnwrapsCaseFoldingFunctions() {
+    SeekPredicate predicate = new DruidSqlParser(schema()).parseWhere(
+        "SELECT * FROM t WHERE lower(region) = 'cn' AND upper(status) IN ('paid', 'new')");
+
+    // The wrapper forces case-insensitive evaluation even when the session default is false.
+    assertTrue(PredicateEvaluator.compile(predicate, false).matches(row("CN", 1L, "PAID")));
+    assertTrue(PredicateEvaluator.compile(predicate, false).matches(row("cn", 1L, "new")));
+    assertFalse(PredicateEvaluator.compile(predicate, false).matches(row("US", 1L, "PAID")));
+  }
+
+  @Test
+  public void globalIgnoreCaseControlsPlainComparisons() {
+    SeekPredicate predicate = new DruidSqlParser(schema()).parseWhere(
+        "SELECT * FROM t WHERE region = 'cn'");
+
+    assertFalse(PredicateEvaluator.compile(predicate, false).matches(row("CN", 0L, "X")));
+    assertTrue(PredicateEvaluator.compile(predicate, true).matches(row("CN", 0L, "X")));
+    assertTrue(PredicateEvaluator.compile(predicate, true).matches(row("cn", 0L, "X")));
+  }
+
+  @Test
+  public void largeInListUsesSetSemantics() {
+    StringBuilder sql = new StringBuilder("SELECT * FROM t WHERE amount IN (");
+    for (int i = 0; i < 64; i++) {
+      if (i > 0) {
+        sql.append(',');
+      }
+      sql.append(i);
+    }
+    sql.append(')');
+    SeekPredicate predicate = new DruidSqlParser(schema()).parseWhere(sql.toString());
+
+    assertTrue(PredicateEvaluator.compile(predicate, true).matches(row("US", 37L, "X")));
+    assertTrue(PredicateEvaluator.compile(predicate, false).matches(row("US", 63L, "X")));
+    assertFalse(PredicateEvaluator.compile(predicate, true).matches(row("US", 64L, "X")));
+  }
+
+  @Test
+  public void pruningRespectsCaseInsensitiveMode() {
+    final Object min = "Apple";
+    final Object max = "Banana";
+    PruningEvaluator.ColumnStatsProvider provider = column -> new PruningEvaluator.ColumnStats() {
+      @Override
+      public Object min() {
+        return min;
+      }
+
+      @Override
+      public Object max() {
+        return max;
+      }
+
+      @Override
+      public boolean hasNull() {
+        return false;
+      }
+    };
+
+    SeekPredicate predicate = new DruidSqlParser(schema()).parseWhere(
+        "SELECT * FROM t WHERE region = 'apple'");
+    assertFalse(PruningEvaluator.mayMatch(predicate, provider, false));
+    assertTrue(PruningEvaluator.mayMatch(predicate, provider, true));
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void druidRejectsNonCaseFoldingFunction() {
+    new DruidSqlParser(schema()).parseWhere(
+        "SELECT * FROM t WHERE substring(region, 1, 1) = 'C'");
+  }
 }

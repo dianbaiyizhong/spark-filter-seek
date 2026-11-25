@@ -18,14 +18,22 @@ public final class SeekInputPartition implements InputPartition, Serializable {
   private final SeekPredicate predicate;
   private final StructType readSchema;
   private final Map<String, String> conf;
+  /** -1 means no pushed limit; all partitions share the same Redis counter otherwise. */
+  private final int limit;
 
   public SeekInputPartition(String file, String format, SeekPredicate predicate,
       StructType readSchema, Map<String, String> conf) {
+    this(file, format, predicate, readSchema, conf, -1);
+  }
+
+  public SeekInputPartition(String file, String format, SeekPredicate predicate,
+      StructType readSchema, Map<String, String> conf, int limit) {
     this.file = file;
     this.format = format;
     this.predicate = predicate;
     this.readSchema = readSchema;
     this.conf = conf;
+    this.limit = limit;
   }
 
   public String file() {
@@ -48,8 +56,13 @@ public final class SeekInputPartition implements InputPartition, Serializable {
     return conf;
   }
 
+  public int limit() {
+    return limit;
+  }
+
   @Override
   public String toString() {
-    return "SeekInputPartition{" + format + " " + file + '}';
+    return "SeekInputPartition{" + format + " " + file
+        + (limit >= 0 ? " sharedLimit=" + limit : "") + '}';
   }
 }

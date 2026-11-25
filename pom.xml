@@ -18,12 +18,13 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
-    <spark.version>3.5.1</spark.version>
+    <spark.version>3.3.4</spark.version>
     <scala.binary.version>2.12</scala.binary.version>
     <hadoop.version>3.3.4</hadoop.version>
     <orc.version>1.9.2</orc.version>
     <parquet.version>1.13.1</parquet.version>
     <druid.version>1.2.23</druid.version>
+    <redisson.version>3.16.3</redisson.version>
     <junit.version>4.13.2</junit.version>
   </properties>
 
@@ -75,10 +76,24 @@
       <version>${druid.version}</version>
     </dependency>
 
+    <!-- Redisson is not bundled in Spark; submit its jar and Netty deps via spark-submit. -->
+    <dependency>
+      <groupId>org.redisson</groupId>
+      <artifactId>redisson</artifactId>
+      <version>${redisson.version}</version>
+    </dependency>
+
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
       <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Spark 3.3's ORC writer needs protobuf on the test classpath. -->
+    <dependency>
+      <groupId>com.google.protobuf</groupId>
+      <artifactId>protobuf-java</artifactId>
+      <version>3.19.6</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -95,6 +110,99 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
+      </plugin>
+
+      <!-- Bundle Redisson and ALL of its transitive dependencies into the project jar, then
+           relocate them into org.redisson.shaded.* so they cannot collide with the netty /
+           jackson / reactor that Spark itself puts on the classpath. slf4j is deliberately
+           NOT shaded (logging facade is shared with Spark). Druid, Spark, Hadoop, ORC and
+           Parquet are all excluded and remain supplied externally. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <artifactSet>
+                <includes>
+                  <include>org.redisson:redisson</include>
+                  <include>io.netty:*</include>
+                  <include>io.projectreactor:reactor-core</include>
+                  <include>org.reactivestreams:reactive-streams</include>
+                  <include>io.reactivex.rxjava3:rxjava</include>
+                  <include>org.jboss.marshalling:*</include>
+                  <include>org.jodd:*</include>
+                  <include>net.bytebuddy:byte-buddy</include>
+                  <include>javax.cache:cache-api</include>
+                  <include>com.fasterxml.jackson.core:*</include>
+                  <include>com.fasterxml.jackson.dataformat:*</include>
+                  <include>org.yaml:snakeyaml</include>
+                </includes>
+              </artifactSet>
+              <relocations>
+                <relocation>
+                  <pattern>io.netty</pattern>
+                  <shadedPattern>org.redisson.shaded.io.netty</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>reactor</pattern>
+                  <shadedPattern>org.redisson.shaded.reactor</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.reactivestreams</pattern>
+                  <shadedPattern>org.redisson.shaded.org.reactivestreams</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>io.reactivex</pattern>
+                  <shadedPattern>org.redisson.shaded.io.reactivex</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.jboss.marshalling</pattern>
+                  <shadedPattern>org.redisson.shaded.org.jboss.marshalling</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.jodd</pattern>
+                  <shadedPattern>org.redisson.shaded.org.jodd</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>net.bytebuddy</pattern>
+                  <shadedPattern>org.redisson.shaded.net.bytebuddy</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>javax.cache</pattern>
+                  <shadedPattern>org.redisson.shaded.javax.cache</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.fasterxml.jackson</pattern>
+                  <shadedPattern>org.redisson.shaded.com.fasterxml.jackson</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.yaml</pattern>
+                  <shadedPattern>org.redisson.shaded.org.yaml</shadedPattern>
+                </relocation>
+              </relocations>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
 
     </plugins>

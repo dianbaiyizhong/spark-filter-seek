@@ -44,6 +44,7 @@ ORC 阶段二通过 `RecordReader.seekToRow(globalRowId)` 直接定位；Parquet
 - 集合：`IN (...)`、`NOT IN (...)`
 - 字符串：`LIKE 'abc%'`（`%` / `_` 通配符）、`NOT LIKE`
 - 逻辑：`AND` / `OR` / `NOT`
+- 行数：`LIMIT N`（可选，配置 Redis 后下推到扫描阶段，多分区共享一个全局计数器；详见第 6 节）
 
 不支持的表达式（函数、算术、子查询、嵌套字段等）**不会**被吞掉：数据源会把它们返回给 Spark
 重新计算，保证结果正确。阶段一的统计剪枝是保守的，宁可多读块也不会漏掉命中行。
@@ -56,17 +57,19 @@ ORC 阶段二通过 `RecordReader.seekToRow(globalRowId)` 直接定位；Parquet
 
 ```bash
 mvn -q package
-# Druid 不在 Spark 中，单独取一份 jar 随任务提交
+# Druid 不在 Spark 中，单独取 jar 随任务提交
 mvn -q dependency:copy -Dartifact=com.alibaba:druid:1.2.23 -DoutputDirectory=target
 ```
 
 产物：
 
-- `target/spark-filter-seek-1.0.0-SNAPSHOT.jar` — 只含本项目代码
-- `target/druid-1.2.23.jar` — Druid 依赖
+- `target/spark-filter-seek-1.0.0-SNAPSHOT.jar` — 本项目代码 **+ Redisson 及其全部依赖**（已 shade 并重定位）
+- `target/druid-1.2.23.jar` — Druid 依赖（唯一需要额外提交的 jar）
 
-Spark / Hadoop / ORC / Parquet 均标记为 `provided`，由 Spark 运行时提供；不生成 fat jar。
-当前版本基于 **Spark 3.5.1 / Scala 2.12 / Hadoop 3.3.4 / ORC 1.9.2 / Parquet 1.13.1 / Druid 1.2.23**。
+**Redisson 已经打进主 jar，无需再带任何 Redis/Netty 客户端 jar。** shade 时对 netty / jackson / reactor / rxjava 等依赖做了包名重定位（前缀 `org.redisson.shaded.*`），因此与 Spark 自带的同名库完全隔离，不会产生类加载冲突；slf4j 日志门面共享 Spark 的。
+
+Spark / Hadoop / ORC / Parquet 均标记为 `provided`，由 Spark 运行时提供，不打进 jar；Druid 也不打进 jar。
+当前版本基于 **Spark 3.3.4 / Scala 2.12 / Hadoop 3.3.4 / ORC 1.9.2 / Parquet 1.13.1 / Druid 1.2.23 / Redisson 3.16.3**。切换 Spark 小版本只需改 `pom.xml` 的 `spark.version`。
 构建产物为 **Java 8 字节码（major 52）**，可在 JDK 8/11/17 上运行。JDK 8 下直接用 source/target 1.8 构建；JDK 9+ 构建时自动切到 release 8，并仅在测试阶段加 `--add-opens`。JDK 25 因 Hadoop UGI 兼容问题不建议。
 
 ### 3.2 用 Spark SQL 下推过滤
@@ -146,6 +149,13 @@ lower() with ignoreCase=false   : 44 (expected 44)
 | `seek.sql` | 空 | 用 Druid 解析 WHERE 子句 |
 | `seek.dumpPlan` | `false` | 在 executor 日志打印每个块的命中行位置样例 |
 | `seek.ignoreCase` | 取 SparkConf，默认 `true` | 字符串比较是否忽略大小写；优先级高于 SparkConf |
+| `seek.redis.address` | 无 | Redis 地址，如 `redis://127.0.0.1:6379`；配置后才启用 LIMIT 下推 |
+| `seek.redis.password` | 空 | Redis 密码 |
+| `seek.redis.database` | `0` | Redis 数据库编号 |
+| `seek.redis.batch` | `1000` | 每个 task 每次向 Redis 领取的额度条数 |
+| `seek.redis.key` | 每次查询自动生成 | 全局计数器的 key；不指定则按查询 UUID 生成，避免并发查询互相干扰 |
+| `seek.redis.ttlSeconds` | `3600` | 计数器 key 的 TTL，防止查询异常取消后 key 泄漏 |
+| `seek.redis.poolSize` | `8` | 单个 executor JVM 内 Redisson 连接池上限 |
 | `hadoop.*` | 无 | 以 `hadoop.` 开头的参数会去掉前缀后写入 Hadoop Configuration |
 
 会话级开关（可用 `spark-submit --conf` 或 `spark.conf.set`）：
@@ -201,6 +211,42 @@ SeekPlan{orc /data/a.orc, blocks=12, pruned=9, rowsScanned=30000, hits=127}
 - 上线前用同一 SQL 分别跑原生 `orc` / `parquet` 数据源与 `seek` 数据源，对 `count` 和主键集合做一致性校验。
 - **不覆盖式重跑生产数据**：重建索引或修数据先写影子表，校验通过后再切换。
 - 涉及个人信息字段时，在 SELECT 侧做脱敏并控制目录权限；`seek.sql` 中的字面量会进入日志，敏感值需避免明文传入。
+
+---
+
+## 5.2 用 Redis 做全局 LIMIT 控制
+
+不配置 Redis 时，`LIMIT` 由 Spark 自己的 `GlobalLimit` 在 scan 之后处理，扫描层不做提前终止。
+配置 Redis 地址后，`LIMIT N` 会下推到扫描层，所有分区共享一个 Redis 原子计数器：
+
+```scala
+spark.conf.set("spark.filterseek.redis.address", "redis://redis-host:6379")
+spark.conf.set("spark.filterseek.redis.password", "xxx")   // 可选
+
+val df = spark.read.format("filter-seek")
+  .option("path", "s3://bucket/warehouse/fact/")
+  .load()
+
+spark.sql("SELECT * FROM t WHERE amount > 100 LIMIT 10000").show()
+```
+
+工作原理：
+
+1. **driver** 在 build scan 时为本次查询生成唯一的 Redis key，把计数器初始化为 0 并设 TTL。
+2. **每个 task** 从 Redis 批量领取额度：一次 `INCRBY batch` 拿到一段连续的全局序号区间，
+   超出全局 `LIMIT N` 的部分会被裁剪，因此所有 task 发出的行总数**精确不超过 N**。
+3. 本地额度用完才再次访问 Redis。`batch=1000`、`LIMIT=100000` 时整个查询只有约 100 次
+   Redis 往返，与实际扫描行数无关。
+4. **连接数控制**：Redisson 客户端按连接参数在 executor JVM 内做进程级单例缓存，
+   所有 task 共享同一个连接池；`seek.redis.poolSize` 限制每个客户端的连接上限。
+   不会出现"每 task 一个客户端"的连接爆炸。
+
+注意：
+
+- Redisson 及其依赖（含 Netty）已 shade 进主 jar 并做了包名重定位，无需随任务单独提交；只有 Druid 仍需单独带 jar（见 3.1 构建）。
+- 配额块是"先占后用"，task 结束时未用完的额度只在本地归还，不回写 Redis，
+  因此极端情况下（大量 task 各自只领不用）实际返回可能略少于 N，但绝不会超过 N。
+- 计数器 key 默认每次查询自动生成，避免并发查询互相重置；若需跨查询共享配额可显式设置 `seek.redis.key`。
 
 ---
 

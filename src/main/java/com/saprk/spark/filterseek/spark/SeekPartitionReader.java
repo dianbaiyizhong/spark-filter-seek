@@ -4,12 +4,15 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.saprk.spark.filterseek.limit.LimitBudget;
+import com.saprk.spark.filterseek.limit.RedissonHolder;
 import com.saprk.spark.filterseek.reader.OrcRowFetcher;
 import com.saprk.spark.filterseek.reader.ParquetRowFetcher;
 import com.saprk.spark.filterseek.seek.OrcSeekIndex;
@@ -17,6 +20,7 @@ import com.saprk.spark.filterseek.seek.ParquetSeekIndex;
 import com.saprk.spark.filterseek.seek.RowFetcher;
 import com.saprk.spark.filterseek.seek.SeekIndex;
 import com.saprk.spark.filterseek.seek.SeekPlan;
+import com.saprk.spark.filterseek.util.ConfUtils;
 
 /** Drives phase 1 (positions) then phase 2 (column fetch) for one file. */
 public final class SeekPartitionReader implements PartitionReader<InternalRow> {
@@ -29,17 +33,54 @@ public final class SeekPartitionReader implements PartitionReader<InternalRow> {
   private InternalRow current;
   private boolean initialized;
   private boolean exhausted;
+  private final LimitBudget budget;
 
   public SeekPartitionReader(SeekInputPartition partition) {
     this.partition = partition;
     this.index = "parquet".equals(partition.format())
         ? new ParquetSeekIndex() : new OrcSeekIndex();
+    if (partition.limit() >= 0) {
+      Map<String, String> conf = partition.conf();
+      this.budget = new LimitBudget(
+          RedissonHolder.counter(conf.get(ConfUtils.REDIS_ADDRESS_OPTION),
+              conf.get(ConfUtils.REDIS_PASSWORD_OPTION),
+              parseInt(conf.get(ConfUtils.REDIS_DB_OPTION), 0),
+              parseInt(conf.get(ConfUtils.REDIS_POOL_OPTION), ConfUtils.DEFAULT_REDIS_POOL_SIZE),
+              conf.get(ConfUtils.REDIS_KEY_OPTION)),
+          partition.limit(),
+          parseInt(conf.get(ConfUtils.REDIS_BATCH_OPTION), ConfUtils.DEFAULT_REDIS_BATCH));
+    } else {
+      this.budget = null;
+    }
+  }
+
+  private static int parseInt(String raw, int fallback) {
+    if (raw == null || raw.isEmpty()) {
+      return fallback;
+    }
+    try {
+      return Integer.parseInt(raw);
+    } catch (NumberFormatException e) {
+      return fallback;
+    }
   }
 
   @Override
   public boolean next() throws IOException {
     if (exhausted) {
       return false;
+    }
+    // Global cap reached: stop before doing any more phase-1 scanning or column fetching.
+    // Acquire a permit up front; if this call ends up with no row, refund it locally.
+    boolean permitHeld = false;
+    if (budget != null) {
+      if (!budget.tryAcquire()) {
+        exhausted = true;
+        closeFetcher();
+        LOG.info("Global limit reached, task emitted={}", budget.emitted());
+        return false;
+      }
+      permitHeld = true;
     }
     if (!initialized) {
       initialized = true;
@@ -63,6 +104,9 @@ public final class SeekPartitionReader implements PartitionReader<InternalRow> {
           hits.sort((a, b) -> Long.compare(a.globalRowId(), b.globalRowId()));
         } else {
           exhausted = true;
+          if (permitHeld) {
+            budget.refund();
+          }
           return false;
         }
       } else {
@@ -74,6 +118,9 @@ public final class SeekPartitionReader implements PartitionReader<InternalRow> {
     current = fetcher.next();
     if (current == null) {
       exhausted = true;
+      if (permitHeld) {
+        budget.refund();
+      }
       return false;
     }
     return true;
@@ -92,11 +139,15 @@ public final class SeekPartitionReader implements PartitionReader<InternalRow> {
     return new OrcRowFetcher(partition.file(), partition.readSchema(), hits, partition.conf());
   }
 
-  @Override
-  public void close() throws IOException {
+  private void closeFetcher() throws IOException {
     if (fetcher != null) {
       fetcher.close();
       fetcher = null;
     }
+  }
+
+  @Override
+  public void close() throws IOException {
+    closeFetcher();
   }
 }

@@ -26,6 +26,29 @@ public final class ConfUtils {
   public static final String IGNORE_CASE_SPARK_CONF = "spark.filterseek.ignoreCase";
   public static final boolean DEFAULT_IGNORE_CASE = true;
 
+  /** Redis address for global LIMIT control, e.g. redis://127.0.0.1:6379. */
+  public static final String REDIS_ADDRESS_OPTION = "seek.redis.address";
+  public static final String REDIS_ADDRESS_SPARK_CONF = "spark.filterseek.redis.address";
+  public static final String REDIS_PASSWORD_OPTION = "seek.redis.password";
+  public static final String REDIS_PASSWORD_SPARK_CONF = "spark.filterseek.redis.password";
+  public static final String REDIS_DB_OPTION = "seek.redis.database";
+  public static final String REDIS_DB_SPARK_CONF = "spark.filterseek.redis.database";
+  /** How many rows a task takes from Redis per round trip. */
+  public static final String REDIS_BATCH_OPTION = "seek.redis.batch";
+  public static final String REDIS_BATCH_SPARK_CONF = "spark.filterseek.redis.batch";
+  public static final int DEFAULT_REDIS_BATCH = 1000;
+  /** Shared Redis key name for the counter; auto-generated per query if absent. */
+  public static final String REDIS_KEY_OPTION = "seek.redis.key";
+  public static final String REDIS_KEY_SPARK_CONF = "spark.filterseek.redis.key";
+  /** TTL of the counter key in seconds, to avoid leaks on cancelled queries. */
+  public static final String REDIS_TTL_OPTION = "seek.redis.ttlSeconds";
+  public static final String REDIS_TTL_SPARK_CONF = "spark.filterseek.redis.ttlSeconds";
+  public static final int DEFAULT_REDIS_TTL_SECONDS = 3600;
+  /** Max connections per Redisson client in one JVM; bounds total connections on executors. */
+  public static final String REDIS_POOL_OPTION = "seek.redis.poolSize";
+  public static final String REDIS_POOL_SPARK_CONF = "spark.filterseek.redis.poolSize";
+  public static final int DEFAULT_REDIS_POOL_SIZE = 8;
+
   private ConfUtils() {
   }
 
@@ -43,6 +66,66 @@ public final class ConfUtils {
       return DEFAULT_IGNORE_CASE;
     }
     return Boolean.parseBoolean(raw.trim());
+  }
+
+  /** Generic resolution: per-read option, then SparkConf, then default. */
+  private static String resolve(Map<String, String> options, String optionKey,
+      String sparkConfKey, String defaultValue) {
+    String raw = options == null ? null : options.get(optionKey);
+    if (isBlank(raw)) {
+      raw = sparkConfValue(sparkConfKey);
+    }
+    if (isBlank(raw)) {
+      return defaultValue;
+    }
+    return raw.trim();
+  }
+
+  private static int resolveInt(Map<String, String> options, String optionKey,
+      String sparkConfKey, int defaultValue) {
+    String raw = resolve(options, optionKey, sparkConfKey, null);
+    if (raw == null) {
+      return defaultValue;
+    }
+    try {
+      return Integer.parseInt(raw);
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException("Invalid integer for " + optionKey + ": " + raw, e);
+    }
+  }
+
+  public static String redisAddress(Map<String, String> options) {
+    return resolve(options, REDIS_ADDRESS_OPTION, REDIS_ADDRESS_SPARK_CONF, null);
+  }
+
+  public static String redisPassword(Map<String, String> options) {
+    return resolve(options, REDIS_PASSWORD_OPTION, REDIS_PASSWORD_SPARK_CONF, null);
+  }
+
+  public static int redisDatabase(Map<String, String> options) {
+    return resolveInt(options, REDIS_DB_OPTION, REDIS_DB_SPARK_CONF, 0);
+  }
+
+  public static int redisBatch(Map<String, String> options) {
+    int batch = resolveInt(options, REDIS_BATCH_OPTION, REDIS_BATCH_SPARK_CONF,
+        DEFAULT_REDIS_BATCH);
+    return batch <= 0 ? DEFAULT_REDIS_BATCH : batch;
+  }
+
+  public static String redisKey(Map<String, String> options) {
+    return resolve(options, REDIS_KEY_OPTION, REDIS_KEY_SPARK_CONF, null);
+  }
+
+  public static int redisTtlSeconds(Map<String, String> options) {
+    int ttl = resolveInt(options, REDIS_TTL_OPTION, REDIS_TTL_SPARK_CONF,
+        DEFAULT_REDIS_TTL_SECONDS);
+    return ttl <= 0 ? DEFAULT_REDIS_TTL_SECONDS : ttl;
+  }
+
+  public static int redisPoolSize(Map<String, String> options) {
+    int size = resolveInt(options, REDIS_POOL_OPTION, REDIS_POOL_SPARK_CONF,
+        DEFAULT_REDIS_POOL_SIZE);
+    return size <= 0 ? DEFAULT_REDIS_POOL_SIZE : size;
   }
 
   private static String sparkConfValue(String key) {

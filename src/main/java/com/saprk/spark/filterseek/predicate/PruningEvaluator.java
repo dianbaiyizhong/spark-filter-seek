@@ -162,6 +162,9 @@ public final class PruningEvaluator {
 
   /** Returns the fixed prefix of a LIKE pattern, or null when it starts with a wildcard. */
   private static String literalPrefix(String pattern) {
+    if (pattern == null) {
+      return null;
+    }
     StringBuilder prefix = new StringBuilder();
     boolean escaped = false;
     for (int i = 0; i < pattern.length(); i++) {

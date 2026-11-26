@@ -17,6 +17,7 @@ import com.alibaba.druid.sql.ast.expr.SQLIdentifierExpr;
 import com.alibaba.druid.sql.ast.expr.SQLInListExpr;
 import com.alibaba.druid.sql.ast.expr.SQLLiteralExpr;
 import com.alibaba.druid.sql.ast.expr.SQLMethodInvokeExpr;
+import com.alibaba.druid.sql.ast.expr.SQLNullExpr;
 import com.alibaba.druid.sql.ast.expr.SQLPropertyExpr;
 import com.alibaba.druid.sql.ast.expr.SQLUnaryExpr;
 import com.alibaba.druid.sql.ast.expr.SQLUnaryOperator;
@@ -99,12 +100,16 @@ public final class DruidSqlParser {
 
   private static SQLSelect parseSelect(String sql, String errorMessage) {
     List<SQLStatement> statements = SQLUtils.parseStatements(sql, DbType.mysql);
-    if (statements.size() != 1) {
+    if (statements == null || statements.size() != 1) {
       throw new IllegalArgumentException(errorMessage);
     }
     SQLStatement statement = statements.get(0);
     if (statement instanceof SQLSelectStatement) {
-      return ((SQLSelectStatement) statement).getSelect();
+      SQLSelect select = ((SQLSelectStatement) statement).getSelect();
+      if (select == null) {
+        throw new IllegalArgumentException(errorMessage);
+      }
+      return select;
     }
     if (statement instanceof SQLSelect) {
       return (SQLSelect) statement;
@@ -119,8 +124,12 @@ public final class DruidSqlParser {
     if (expr instanceof SQLInListExpr) {
       SQLInListExpr in = (SQLInListExpr) expr;
       ColumnRef ref = columnRef(in.getExpr());
+      List<SQLExpr> targets = in.getTargetList();
+      if (targets == null) {
+        throw unsupported("IN with a subquery or empty target list");
+      }
       List<LiteralValue> values = new ArrayList<>();
-      for (SQLExpr target : in.getTargetList()) {
+      for (SQLExpr target : targets) {
         values.add(literal(target, columnType(ref.name)));
       }
       return new SeekPredicate.In(ref.name, values, in.isNot(),
@@ -201,15 +210,17 @@ public final class DruidSqlParser {
       caseFolded = true;
       expr = call.getArguments().get(0);
     }
-    String name;
+    String name = null;
     if (expr instanceof SQLIdentifierExpr) {
       name = ((SQLIdentifierExpr) expr).getName();
     } else if (expr instanceof SQLPropertyExpr) {
       name = ((SQLPropertyExpr) expr).getName();
-    } else {
+    } else if (expr != null) {
       throw unsupported("filter left-hand side must be a simple column "
-          + "(optionally wrapped in lower/upper), got "
-          + (expr == null ? "null" : expr.getClass().getSimpleName()));
+          + "(optionally wrapped in lower/upper), got " + expr.getClass().getSimpleName());
+    }
+    if (name == null || name.trim().isEmpty()) {
+      throw unsupported("filter left-hand side must be a simple column with a non-empty name");
     }
     String lower = name.toLowerCase(Locale.ROOT);
     if (!knownColumns.contains(lower)) {
@@ -243,9 +254,15 @@ public final class DruidSqlParser {
   }
 
   private String stringValue(SQLExpr expr, String column) {
+    if (expr == null || expr instanceof SQLNullExpr) {
+      throw unsupported("LIKE pattern must be a non-null literal string");
+    }
     if (expr instanceof SQLValuableExpr) {
       Object raw = ((SQLValuableExpr) expr).getValue();
-      return raw == null ? null : raw.toString();
+      if (raw == null) {
+        throw unsupported("LIKE pattern must be a non-null literal string");
+      }
+      return raw.toString();
     }
     if (expr instanceof SQLLiteralExpr) {
       return expr.toString();

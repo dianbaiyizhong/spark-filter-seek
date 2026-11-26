@@ -33,7 +33,7 @@ public final class SeekHit implements Serializable {
     return rowInBlock;
   }
 
-  /** Row ordinal inside the file; used to seek with ORC seekToRow. */
+  /** Row ordinal inside the file, used to order hits across blocks. */
   public long globalRowId() {
     return globalRowId;
   }

@@ -196,6 +196,9 @@ public final class PredicateEvaluator {
   }
 
   public static Pattern likePattern(String pattern, boolean ignoreCase) {
+    if (pattern == null) {
+      throw new IllegalArgumentException("LIKE pattern must not be null");
+    }
     StringBuilder regex = new StringBuilder(pattern.length() + 8);
     regex.append('^');
     boolean escaped = false;

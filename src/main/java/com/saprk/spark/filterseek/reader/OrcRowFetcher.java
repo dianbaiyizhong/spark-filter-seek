@@ -12,6 +12,7 @@ import org.apache.hadoop.hive.ql.exec.vector.VectorizedRowBatch;
 import org.apache.orc.OrcFile;
 import org.apache.orc.Reader;
 import org.apache.orc.RecordReader;
+import org.apache.orc.StripeInformation;
 import org.apache.orc.TypeDescription;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.types.StructField;
@@ -29,6 +30,8 @@ public final class OrcRowFetcher implements RowFetcher {
 
   private final Reader reader;
   private final RecordReader rows;
+  private final boolean[] include;
+  private final List<StripeInformation> stripes;
   private final VectorizedRowBatch batch;
   private final List<String> names;
   private final StructType requiredSchema;
@@ -37,8 +40,12 @@ public final class OrcRowFetcher implements RowFetcher {
   private final List<SeekHit> hits;
   private final boolean fullScan;
   private int hitIndex;
-  private long cursor;
   private int fullScanIndex;
+
+  private RecordReader stripeRows;
+  private int currentStripe = -1;
+  private long batchStartInStripe;
+  private boolean batchReady;
 
   public OrcRowFetcher(String file, StructType requiredSchema, List<SeekHit> hits,
       Map<String, String> confMap) throws IOException {
@@ -61,11 +68,12 @@ public final class OrcRowFetcher implements RowFetcher {
       include[schema.getChildren().get(index).getId()] = true;
     }
 
-    this.rows = reader.rows(reader.options().include(include));
-    this.batch = schema.createRowBatch(4096);
     this.hits = hits;
     this.fullScan = hits == null || hits.isEmpty();
-    this.cursor = -1;
+    this.include = include;
+    this.stripes = reader.getStripes();
+    this.rows = fullScan ? reader.rows(reader.options().include(include)) : null;
+    this.batch = schema.createRowBatch(4096);
   }
 
   @Override
@@ -84,14 +92,35 @@ public final class OrcRowFetcher implements RowFetcher {
       return null;
     }
     SeekHit hit = hits.get(hitIndex);
-    if (cursor < 0 || hit.globalRowId() < cursor || hit.globalRowId() >= cursor + batch.size) {
-      rows.seekToRow(hit.globalRowId());
-      if (!rows.nextBatch(batch)) {
-        return null;
-      }
-      cursor = hit.globalRowId();
+
+    // One reader per stripe, scoped to the stripe's byte range. This avoids ORC's seekToRow(),
+    // which throws an NPE on files with bloom-filter indexes (StripePlanner.readRowIndex).
+    if (currentStripe != hit.blockIndex()) {
+      closeStripeReader();
+      StripeInformation stripe = stripes.get(hit.blockIndex());
+      stripeRows = reader.rows(reader.options()
+          .range(stripe.getOffset(), stripe.getLength())
+          .include(include));
+      currentStripe = hit.blockIndex();
+      batchReady = false;
+      batchStartInStripe = 0;
     }
-    int offset = (int) (hit.globalRowId() - cursor);
+
+    int offset;
+    while (true) {
+      if (!batchReady) {
+        if (!stripeRows.nextBatch(batch)) {
+          return null;
+        }
+        batchReady = true;
+      }
+      if (hit.rowInBlock() < batchStartInStripe + batch.size) {
+        offset = (int) (hit.rowInBlock() - batchStartInStripe);
+        break;
+      }
+      batchStartInStripe += batch.size;
+      batchReady = false;
+    }
     hitIndex++;
     return convert(batch, offset);
   }
@@ -118,8 +147,18 @@ public final class OrcRowFetcher implements RowFetcher {
     return -1;
   }
 
+  private void closeStripeReader() throws IOException {
+    if (stripeRows != null) {
+      stripeRows.close();
+      stripeRows = null;
+    }
+  }
+
   @Override
   public void close() throws IOException {
-    rows.close();
+    closeStripeReader();
+    if (rows != null) {
+      rows.close();
+    }
   }
 }

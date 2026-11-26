@@ -79,23 +79,29 @@ public final class OrcSeekIndex implements SeekIndex {
     long rowsScanned = 0;
     long stripeStart = 0;
 
-    try (RecordReader rows = reader.rows(reader.options().include(include))) {
-      VectorizedRowBatch batch = schema.createRowBatch(BATCH_SIZE);
-      for (int stripeIndex = 0; stripeIndex < stripes.size(); stripeIndex++) {
-        long stripeRows = stripes.get(stripeIndex).getNumberOfRows();
-        PruningEvaluator.ColumnStatsProvider stats = new OrcColumnStatsProvider(
-            stripeStats.get(stripeIndex), schema, names);
-        if (!PruningEvaluator.mayMatch(predicate, stats, ignoreCase)) {
-          blocksPruned++;
-          stripeStart += stripeRows;
-          continue;
-        }
+    for (int stripeIndex = 0; stripeIndex < stripes.size(); stripeIndex++) {
+      StripeInformation stripe = stripes.get(stripeIndex);
+      long stripeRows = stripe.getNumberOfRows();
+      PruningEvaluator.ColumnStatsProvider stats = new OrcColumnStatsProvider(
+          stripeStats.get(stripeIndex), schema, names);
+      if (!PruningEvaluator.mayMatch(predicate, stats, ignoreCase)) {
+        blocksPruned++;
+        stripeStart += stripeRows;
+        continue;
+      }
 
-        rows.seekToRow(stripeStart);
+      // Do NOT use seekToRow() here. With ORC bloom-filter indexes, seekToRow() asks ORC to
+      // read row indexes with a null sargColumns array and throws an NPE inside StripePlanner.
+      // A reader scoped to this stripe's byte range starts exactly at row 0 of the stripe and
+      // never touches the row-index path.
+      org.apache.orc.Reader.Options stripeOptions = reader.options()
+          .range(stripe.getOffset(), stripe.getLength())
+          .include(include);
+      try (RecordReader rows = reader.rows(stripeOptions)) {
+        VectorizedRowBatch batch = schema.createRowBatch(BATCH_SIZE);
         long rowInStripe = 0;
-        long remaining = stripeRows;
-        while (remaining > 0 && rows.nextBatch(batch)) {
-          int count = (int) Math.min(remaining, batch.size);
+        while (rowInStripe < stripeRows && rows.nextBatch(batch)) {
+          int count = (int) Math.min(stripeRows - rowInStripe, batch.size);
           for (int r = 0; r < count; r++) {
             Map<String, Object> values = extract(batch, r, filterColumns, names, tableSchema);
             if (evaluator.matches(values)) {
@@ -104,11 +110,10 @@ public final class OrcSeekIndex implements SeekIndex {
             }
           }
           rowInStripe += count;
-          remaining -= count;
           rowsScanned += count;
         }
-        stripeStart += stripeRows;
       }
+      stripeStart += stripeRows;
     }
     return new SeekPlan(file, "orc", hits, stripes.size(), blocksPruned, rowsScanned);
   }
